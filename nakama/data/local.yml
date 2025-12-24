@@ -1,0 +1,32 @@
+name: nakama-mall-app
+data_dir: "./data/"
+
+logger:
+  stdout: true
+  level: "debug"
+  file: ""
+
+console:
+  port: 7351
+  username: "admin"
+  password: "password"
+  signing_key: "defaultsigningkey"
+  token_expiry_sec: 86400
+
+socket:
+  server_key: "defaultkey"
+  port: 7350
+  max_message_size_bytes: 4096
+  read_buffer_size_bytes: 4096
+  write_buffer_size_bytes: 4096
+  ping_period_ms: 10000
+  pong_wait_ms: 15000
+  write_wait_ms: 10000
+  outgoing_queue_size: 16
+
+runtime:
+  env:
+    - "PATH=/nakama/data/modules/node_modules/.bin:$PATH"
+  path: "/nakama/data/modules"
+  http_key: "defaulthttpkey"
+  js_entrypoint: "build/main.js"

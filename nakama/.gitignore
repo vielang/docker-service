@@ -1,0 +1,16 @@
+# Nakama Data
+data/*.db
+data/*.log
+data/data/
+
+# Node modules
+modules/node_modules/
+modules/build/
+modules/*.log
+
+# Docker volumes
+postgres-data/
+
+# OS files
+.DS_Store
+*.swp
