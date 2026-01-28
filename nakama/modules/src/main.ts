@@ -1,211 +1,5 @@
 // Nakama Server Module - Main Entry Point
 // This module handles multiplayer match creation and management for Mall App
-//
-// Optimized for 50+ players with:
-// - AOI (Area of Interest) based broadcasting
-// - Map-based filtering
-// - State batching (aggregated updates per tick)
-
-// ============================================================================
-// Constants
-// ============================================================================
-
-const AOI_CELL_SIZE = 200; // Pixels per grid cell
-const AOI_RADIUS = 600; // Only broadcast to players within this radius
-
-// OpCodes (must match Flutter's OpCode class)
-const OP_PLAYER_MOVE = 1; // Legacy: client sends position
-const OP_PLAYER_STATE = 2; // Server broadcasts state
-const OP_MAP_CHANGE = 3; // Client changed map
-const OP_PLAYER_INPUT = 4; // Server-authoritative: client sends input only
-const OP_SERVER_POSITION = 5; // Server sends authoritative position
-
-// Movement constants (must match Flutter's Player component)
-const WALK_SPEED = 80; // pixels per second
-const RUN_SPEED = 160; // pixels per second
-const MAX_SPEED_TOLERANCE = 1.2; // Allow 20% tolerance for lag
-
-// Direction constants (0=left, 1=right, 2=up, 3=down, 4=none)
-const DIR_LEFT = 0;
-const DIR_RIGHT = 1;
-const DIR_UP = 2;
-const DIR_DOWN = 3;
-const DIR_NONE = 4;
-
-// ============================================================================
-// Movement Calculation Helpers
-// ============================================================================
-
-/**
- * Calculate velocity from direction and running state
- */
-function calculateVelocity(
-  direction: number,
-  isRunning: boolean
-): { vx: number; vy: number } {
-  const speed = isRunning ? RUN_SPEED : WALK_SPEED;
-
-  switch (direction) {
-    case DIR_LEFT:
-      return { vx: -speed, vy: 0 };
-    case DIR_RIGHT:
-      return { vx: speed, vy: 0 };
-    case DIR_UP:
-      return { vx: 0, vy: -speed };
-    case DIR_DOWN:
-      return { vx: 0, vy: speed };
-    default:
-      return { vx: 0, vy: 0 };
-  }
-}
-
-/**
- * Update player position based on velocity and delta time
- * Returns new position (no collision checking yet)
- */
-function updatePosition(
-  currentX: number,
-  currentY: number,
-  vx: number,
-  vy: number,
-  dt: number
-): { x: number; y: number } {
-  return {
-    x: currentX + vx * dt,
-    y: currentY + vy * dt,
-  };
-}
-
-/**
- * Encode server position to binary format (version 4)
- * Format: [version(1), x(2), y(2), direction(1), flags(1), sequence(1), reserved(1)]
- */
-function encodeServerPosition(
-  x: number,
-  y: number,
-  direction: number,
-  isRunning: boolean,
-  sequence: number
-): ArrayBuffer {
-  const buffer = new ArrayBuffer(9);
-  const view = new DataView(buffer);
-
-  view.setUint8(0, 4); // version
-  view.setInt16(1, Math.round(x), true); // little endian
-  view.setInt16(3, Math.round(y), true);
-  view.setUint8(5, direction & 0x07);
-  view.setUint8(6, isRunning ? 1 : 0);
-  view.setUint8(7, sequence & 0xff);
-  view.setUint8(8, 0); // reserved
-
-  return buffer;
-}
-
-/**
- * Decode player input from binary format (version 3)
- * Format: [version(1), direction(1), flags(1), sequence(1)]
- */
-function decodePlayerInput(
-  data: ArrayBuffer
-): { direction: number; isRunning: boolean; sequence: number } | null {
-  if (data.byteLength < 4) return null;
-
-  const view = new DataView(data);
-  const version = view.getUint8(0);
-
-  if (version !== 3) return null;
-
-  return {
-    direction: view.getUint8(1),
-    isRunning: view.getUint8(2) === 1,
-    sequence: view.getUint8(3),
-  };
-}
-
-// ============================================================================
-// AOI Grid - Spatial Partitioning for O(1) Player Queries
-// ============================================================================
-
-class AOIGrid {
-  private cells: Map<string, Set<string>> = new Map();
-  private playerCells: Map<string, string> = new Map();
-  private cellSize: number;
-
-  constructor(cellSize: number = AOI_CELL_SIZE) {
-    this.cellSize = cellSize;
-  }
-
-  private getCellKey(x: number, y: number): string {
-    const cellX = Math.floor(x / this.cellSize);
-    const cellY = Math.floor(y / this.cellSize);
-    return `${cellX},${cellY}`;
-  }
-
-  updatePlayer(userId: string, x: number, y: number): void {
-    const newCell = this.getCellKey(x, y);
-    const oldCell = this.playerCells.get(userId);
-
-    // Skip if player hasn't changed cells
-    if (oldCell === newCell) return;
-
-    // Remove from old cell
-    if (oldCell) {
-      const oldCellPlayers = this.cells.get(oldCell);
-      if (oldCellPlayers) {
-        oldCellPlayers.delete(userId);
-        if (oldCellPlayers.size === 0) {
-          this.cells.delete(oldCell);
-        }
-      }
-    }
-
-    // Add to new cell
-    if (!this.cells.has(newCell)) {
-      this.cells.set(newCell, new Set());
-    }
-    this.cells.get(newCell)!.add(userId);
-    this.playerCells.set(userId, newCell);
-  }
-
-  removePlayer(userId: string): void {
-    const cell = this.playerCells.get(userId);
-    if (cell) {
-      const cellPlayers = this.cells.get(cell);
-      if (cellPlayers) {
-        cellPlayers.delete(userId);
-        if (cellPlayers.size === 0) {
-          this.cells.delete(cell);
-        }
-      }
-      this.playerCells.delete(userId);
-    }
-  }
-
-  getPlayersInRadius(centerX: number, centerY: number, radius: number): Set<string> {
-    const result = new Set<string>();
-    const cellRadius = Math.ceil(radius / this.cellSize);
-    const centerCellX = Math.floor(centerX / this.cellSize);
-    const centerCellY = Math.floor(centerY / this.cellSize);
-
-    // Check all cells within radius
-    for (let dx = -cellRadius; dx <= cellRadius; dx++) {
-      for (let dy = -cellRadius; dy <= cellRadius; dy++) {
-        const cellKey = `${centerCellX + dx},${centerCellY + dy}`;
-        const cellPlayers = this.cells.get(cellKey);
-        if (cellPlayers) {
-          cellPlayers.forEach((playerId) => result.add(playerId));
-        }
-      }
-    }
-
-    return result;
-  }
-
-  clear(): void {
-    this.cells.clear();
-    this.playerCells.clear();
-  }
-}
 
 // ============================================================================
 // Type Definitions
@@ -222,32 +16,14 @@ interface MatchState {
   maxPlayers: number;
   players: { [userId: string]: MatchPlayer };
   createdAt: number;
-  // AOI optimization
-  aoiGrid: AOIGrid;
-  // Batching: pending updates to send this tick
-  pendingUpdates: Map<string, PendingUpdate>;
-}
-
-interface PendingUpdate {
-  userId: string;
-  opCode: number;
-  data: ArrayBuffer;
-  reliable: boolean;
 }
 
 interface MatchPlayer {
   userId: string;
-  sessionId: string; // Required for targeted broadcasts
   username: string;
-  node: string;
   joinedAt: number;
   currentMap: string;
   lastPosition: { x: number; y: number };
-  // Server-authoritative movement state
-  direction: number; // Current movement direction
-  isRunning: boolean;
-  lastInputTime: number; // Timestamp of last input (ms)
-  lastInputSequence: number; // For client reconciliation
 }
 
 // ============================================================================
@@ -262,7 +38,7 @@ function rpcGetWaitingMatch(
 ): string {
   logger.info('📞 RPC called: get_waiting_match');
 
-  const MAX_PLAYERS = 50; // Increased for 50+ players (AOI optimized)
+  const MAX_PLAYERS = 15;
   const MATCH_LABEL = 'eco_conscience_global';
 
   try {
@@ -581,27 +357,23 @@ function matchInit(
   nk: nkruntime.Nakama,
   params: { [key: string]: string }
 ): { state: MatchState; tickRate: number; label: string } {
-  logger.info('🎮 Match initializing with AOI optimization...');
+  logger.info('🎮 Match initializing...');
 
   const label = params.label || 'eco_conscience_global';
-  const maxPlayers = parseInt(params.maxPlayers || '50'); // Increased for 50+ players
+  const maxPlayers = parseInt(params.maxPlayers || '15');
 
   const state: MatchState = {
     label: label,
     maxPlayers: maxPlayers,
     players: {},
     createdAt: Date.now(),
-    // Initialize AOI grid for spatial queries
-    aoiGrid: new AOIGrid(AOI_CELL_SIZE),
-    // Initialize pending updates map for batching
-    pendingUpdates: new Map(),
   };
 
-  logger.info(`✅ Match initialized: ${label} (max ${maxPlayers} players, AOI enabled)`);
+  logger.info(`✅ Match initialized: ${label} (max ${maxPlayers} players)`);
 
   return {
     state: state,
-    tickRate: 20, // 20 ticks per second (50ms) for smoother updates
+    tickRate: 10, // 10 ticks per second
     label: label,
   };
 }
@@ -649,27 +421,14 @@ function matchJoin(
   for (const presence of presences) {
     logger.info(`✅ Player joined: ${presence.username} (${presence.userId})`);
 
-    const defaultX = 96;
-    const defaultY = 384;
-
-    // Add player to state (including sessionId for targeted broadcasts)
+    // Add player to state
     state.players[presence.userId] = {
       userId: presence.userId,
-      sessionId: presence.sessionId,
       username: presence.username,
-      node: presence.node,
       joinedAt: Date.now(),
       currentMap: 'outdoors',
-      lastPosition: { x: defaultX, y: defaultY }, // Default spawn position
-      // Server-authoritative movement state
-      direction: DIR_NONE,
-      isRunning: false,
-      lastInputTime: Date.now(),
-      lastInputSequence: 0,
+      lastPosition: { x: 96, y: 384 }, // Default spawn position
     };
-
-    // Add player to AOI grid at spawn position
-    state.aoiGrid.updatePlayer(presence.userId, defaultX, defaultY);
 
     // Broadcast welcome message to the new player
     const welcomeData = {
@@ -724,12 +483,6 @@ function matchLeave(
   for (const presence of presences) {
     logger.info(`👋 Player left: ${presence.username} (${presence.userId})`);
 
-    // Remove player from AOI grid
-    state.aoiGrid.removePlayer(presence.userId);
-
-    // Remove pending updates for this player
-    state.pendingUpdates.delete(presence.userId);
-
     // Remove player from state
     delete state.players[presence.userId];
 
@@ -764,238 +517,45 @@ function matchLoop(
   state: MatchState,
   messages: nkruntime.MatchMessage[]
 ): { state: MatchState } | null {
-  const now = Date.now();
-  const tickDt = 1.0 / 20; // 20 ticks per second = 50ms per tick
-
-  // ============================================================================
-  // PHASE 1: Process incoming messages
-  // ============================================================================
+  // Process incoming messages and relay them to other players
 
   for (const message of messages) {
     const sender = message.sender;
-    const senderPlayer = state.players[sender.userId];
 
-    if (!senderPlayer) continue;
-
-    // Handle based on OpCode
-    if (message.opCode === OP_PLAYER_INPUT) {
-      // ========================================
-      // SERVER-AUTHORITATIVE MODE: Process input
-      // ========================================
-      const input = decodePlayerInput(message.data as ArrayBuffer);
-      if (input) {
-        // Update player's input state
-        senderPlayer.direction = input.direction;
-        senderPlayer.isRunning = input.isRunning;
-        senderPlayer.lastInputSequence = input.sequence;
-        senderPlayer.lastInputTime = now;
-
-        // Mark player as needing position broadcast
-        state.pendingUpdates.set(sender.userId, {
-          userId: sender.userId,
-          opCode: OP_SERVER_POSITION, // Will broadcast authoritative position
-          data: new ArrayBuffer(0), // Will be calculated later
-          reliable: true,
-        });
-      }
-    } else if (message.opCode === OP_PLAYER_MOVE || message.opCode === OP_PLAYER_STATE) {
-      // ========================================
-      // LEGACY MODE: Client sends position directly
-      // (Still supported for backward compatibility)
-      // ========================================
-      let parsedData: { x?: number; y?: number; d?: number; r?: boolean } | null = null;
-
-      try {
-        const jsonStr = nk.binaryToString(message.data as ArrayBuffer);
-        if (jsonStr.startsWith('{')) {
-          parsedData = JSON.parse(jsonStr);
-        }
-      } catch {
-        // Binary format
-        try {
-          const data = message.data as ArrayBuffer;
-          const view = new DataView(data);
-
-          if (data.byteLength >= 7 && view.getUint8(0) === 2) {
-            // V2 binary format (7 bytes)
-            parsedData = {
-              x: view.getInt16(1, true),
-              y: view.getInt16(3, true),
-              d: view.getUint8(5),
-              r: view.getUint8(6) === 1,
-            };
-          } else if (data.byteLength >= 10) {
-            // V1 binary format (13 bytes, float32)
-            parsedData = {
-              x: view.getFloat32(0, true),
-              y: view.getFloat32(4, true),
-              d: view.getUint8(8),
-              r: view.getUint8(9) === 1,
-            };
-          }
-        } catch {
-          // Ignore
-        }
-      }
-
-      if (parsedData && parsedData.x !== undefined && parsedData.y !== undefined) {
-        // VALIDATION: Check if movement speed is reasonable (anti-cheat)
-        const lastPos = senderPlayer.lastPosition;
-        const dx = parsedData.x - lastPos.x;
-        const dy = parsedData.y - lastPos.y;
-        const distance = Math.sqrt(dx * dx + dy * dy);
-        const maxAllowed = RUN_SPEED * tickDt * MAX_SPEED_TOLERANCE * 10; // Allow some lag buffer
-
-        if (distance <= maxAllowed || distance < 5) {
-          // Valid movement - update position
-          senderPlayer.lastPosition = { x: parsedData.x, y: parsedData.y };
-          if (parsedData.d !== undefined) senderPlayer.direction = parsedData.d;
-          if (parsedData.r !== undefined) senderPlayer.isRunning = parsedData.r;
-
-          // Update AOI grid
-          state.aoiGrid.updatePlayer(sender.userId, parsedData.x, parsedData.y);
-
-          // Store for broadcast
-          state.pendingUpdates.set(sender.userId, {
-            userId: sender.userId,
-            opCode: message.opCode,
-            data: message.data as ArrayBuffer,
-            reliable: message.reliable,
-          });
-        } else {
-          // Suspicious movement - log but don't reject (could be lag)
-          // In production, you might want to: reset position, kick player, etc.
-          logger.warn(
-            `⚠️ Suspicious movement from ${sender.username}: distance=${distance.toFixed(0)}, max=${maxAllowed.toFixed(0)}`
-          );
-        }
-      }
-    } else if (message.opCode === OP_MAP_CHANGE) {
-      // Handle map change
-      try {
-        const jsonStr = nk.binaryToString(message.data as ArrayBuffer);
-        const data = JSON.parse(jsonStr);
-        if (data.d && data.d.map) {
-          senderPlayer.currentMap = data.d.map;
-        }
-      } catch {
-        // Ignore
-      }
-    }
-  }
-
-  // ============================================================================
-  // PHASE 2: Server-side movement calculation for input-based players
-  // ============================================================================
-
-  for (const player of Object.values(state.players)) {
-    // Only process players with active input (direction != none)
-    if (player.direction === DIR_NONE) continue;
-
-    // Calculate velocity based on direction
-    const velocity = calculateVelocity(player.direction, player.isRunning);
-
-    if (velocity.vx !== 0 || velocity.vy !== 0) {
-      // Update position
-      const newPos = updatePosition(
-        player.lastPosition.x,
-        player.lastPosition.y,
-        velocity.vx,
-        velocity.vy,
-        tickDt
-      );
-
-      // TODO: Add collision checking here if needed
-      // For now, just update position
-
-      player.lastPosition = newPos;
-
-      // Update AOI grid
-      state.aoiGrid.updatePlayer(player.userId, newPos.x, newPos.y);
-
-      // Ensure this player's position is broadcast
-      if (!state.pendingUpdates.has(player.userId)) {
-        state.pendingUpdates.set(player.userId, {
-          userId: player.userId,
-          opCode: OP_SERVER_POSITION,
-          data: new ArrayBuffer(0),
-          reliable: false, // Position updates can be unreliable for performance
-        });
-      }
-    }
-  }
-
-  // ============================================================================
-  // PHASE 3: Broadcast updates with AOI + Map filtering
-  // ============================================================================
-
-  for (const [senderId, update] of state.pendingUpdates) {
-    const senderPlayer = state.players[senderId];
-    if (!senderPlayer) continue;
-
-    const senderX = senderPlayer.lastPosition.x;
-    const senderY = senderPlayer.lastPosition.y;
-    const senderMap = senderPlayer.currentMap;
-
-    // Get players within AOI radius
-    const nearbyPlayerIds = state.aoiGrid.getPlayersInRadius(
-      senderX,
-      senderY,
-      AOI_RADIUS
+    // IMPORTANT: Relay message to ALL other players (exclude sender)
+    // This is required for multiplayer - Nakama does NOT auto-relay!
+    dispatcher.broadcastMessage(
+      message.opCode,
+      message.data,
+      null, // Send to all
+      sender, // Exclude sender
+      message.reliable
     );
 
-    // Filter recipients: same map + within AOI + not sender
-    const recipients: nkruntime.Presence[] = [];
-
-    for (const playerId of nearbyPlayerIds) {
-      if (playerId === senderId) continue;
-
-      const player = state.players[playerId];
-      if (!player) continue;
-
-      if (player.currentMap !== senderMap) continue;
-
-      recipients.push({
-        userId: playerId,
-        sessionId: player.sessionId,
-        username: player.username,
-        node: player.node,
-      } as nkruntime.Presence);
-    }
-
-    if (recipients.length > 0) {
-      // Determine data to send
-      let dataToSend: ArrayBuffer;
-      let opCodeToSend: number;
-
-      if (update.opCode === OP_SERVER_POSITION) {
-        // Encode authoritative position
-        dataToSend = encodeServerPosition(
-          senderPlayer.lastPosition.x,
-          senderPlayer.lastPosition.y,
-          senderPlayer.direction,
-          senderPlayer.isRunning,
-          senderPlayer.lastInputSequence
-        );
-        opCodeToSend = OP_SERVER_POSITION;
-      } else {
-        // Legacy: forward original data
-        dataToSend = update.data;
-        opCodeToSend = update.opCode;
-      }
-
-      dispatcher.broadcastMessage(
-        opCodeToSend,
-        dataToSend,
-        recipients,
-        null,
-        update.reliable
+    // Try to parse and update state (for server-side tracking)
+    try {
+      const data = JSON.parse(
+        nk.binaryToString(message.data as ArrayBuffer)
       );
+
+      // Update player's last known position/map
+      if (state.players[sender.userId]) {
+        if (data.x !== undefined && data.y !== undefined) {
+          state.players[sender.userId].lastPosition = {
+            x: data.x,
+            y: data.y,
+          };
+        }
+
+        if (data.mapName) {
+          state.players[sender.userId].currentMap = data.mapName;
+        }
+      }
+    } catch (error) {
+      // Ignore parsing errors for binary messages
+      // Binary messages are still relayed above
     }
   }
-
-  // Clear pending updates
-  state.pendingUpdates.clear();
 
   return { state };
 }
