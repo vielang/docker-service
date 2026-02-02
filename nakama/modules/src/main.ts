@@ -32,6 +32,10 @@ const DIR_UP = 2;
 const DIR_DOWN = 3;
 const DIR_NONE = 4;
 
+// Simulation threshold - only simulate if no client update for this long
+// This prevents server simulation from conflicting with client position updates
+const SIMULATION_DELAY_MS = 200; // 200ms = 4 ticks without client update
+
 // ============================================================================
 // Movement Calculation Helpers
 // ============================================================================
@@ -79,13 +83,18 @@ function updatePosition(
 /**
  * Encode server position to binary format (version 4)
  * Format: [version(1), x(2), y(2), direction(1), flags(1), sequence(1), reserved(1)]
+ *
+ * INDUSTRY STANDARD (LoL, Dota 2, Fortnite):
+ * - [collided] flag indicates player hit a wall
+ * - When true, clients should SNAP to position (no interpolation past walls)
  */
 function encodeServerPosition(
   x: number,
   y: number,
   direction: number,
   isRunning: boolean,
-  sequence: number
+  sequence: number,
+  collided: boolean = false
 ): ArrayBuffer {
   const buffer = new ArrayBuffer(9);
   const view = new DataView(buffer);
@@ -94,7 +103,9 @@ function encodeServerPosition(
   view.setInt16(1, Math.round(x), true); // little endian
   view.setInt16(3, Math.round(y), true);
   view.setUint8(5, direction & 0x07);
-  view.setUint8(6, isRunning ? 1 : 0);
+  // Flags: bit 0 = isRunning, bit 1 = collided (INDUSTRY STANDARD)
+  const flags = (isRunning ? 0x01 : 0x00) | (collided ? 0x02 : 0x00);
+  view.setUint8(6, flags);
   view.setUint8(7, sequence & 0xff);
   view.setUint8(8, 0); // reserved
 
@@ -261,6 +272,9 @@ interface MatchPlayer {
   lastInputSequence: number; // For client reconciliation
   // Flag to skip validation on first position update
   hasReceivedFirstPosition: boolean;
+  // INDUSTRY STANDARD: Collision flag for snap-on-collision
+  // When true, player just hit a wall - other clients should SNAP (no interpolation)
+  collided: boolean;
 }
 
 // ============================================================================
@@ -681,6 +695,8 @@ function matchJoin(
       lastInputSequence: 0,
       // First position flag - allow first update without distance validation
       hasReceivedFirstPosition: false,
+      // INDUSTRY STANDARD: Collision flag - forwarded to other clients
+      collided: false,
     };
 
     // Add player to AOI grid at spawn position
@@ -819,8 +835,9 @@ function matchLoop(
       // ========================================
       // LEGACY MODE: Client sends position directly
       // (Still supported for backward compatibility)
+      // INDUSTRY STANDARD: Includes collision flag for snap-on-collision
       // ========================================
-      let parsedData: { x?: number; y?: number; d?: number; r?: boolean } | null = null;
+      let parsedData: { x?: number; y?: number; d?: number; r?: boolean; c?: boolean } | null = null;
 
       try {
         const jsonStr = nk.binaryToString(message.data as ArrayBuffer);
@@ -835,11 +852,14 @@ function matchLoop(
 
           if (data.byteLength >= 7 && view.getUint8(0) === 2) {
             // V2 binary format (7 bytes)
+            // INDUSTRY STANDARD: Flags byte has bit 0 = isRunning, bit 1 = collided
+            const flags = view.getUint8(6);
             parsedData = {
               x: view.getInt16(1, true),
               y: view.getInt16(3, true),
               d: view.getUint8(5),
-              r: view.getUint8(6) === 1,
+              r: (flags & 0x01) === 1,  // bit 0 = isRunning
+              c: (flags & 0x02) !== 0,  // bit 1 = collided (CRITICAL for wall collision sync)
             };
           } else if (data.byteLength >= 10) {
             // V1 binary format (13 bytes, float32)
@@ -848,6 +868,7 @@ function matchLoop(
               y: view.getFloat32(4, true),
               d: view.getUint8(8),
               r: view.getUint8(9) === 1,
+              c: false, // V1 doesn't support collision flag
             };
           }
         } catch {
@@ -863,6 +884,27 @@ function matchLoop(
         const distance = Math.sqrt(dx * dx + dy * dy);
         const maxAllowed = RUN_SPEED * tickDt * MAX_SPEED_TOLERANCE * 10; // Allow some lag buffer
 
+        // ═══════════════════════════════════════════════════════════════════
+        // FIX: Detect stale/invalid position and reset first position flag
+        // This handles:
+        // 1. Invalid positions (y < 0 is outside map bounds)
+        // 2. Very stale positions (no update for >5 seconds = likely reconnect)
+        // 3. Extreme position differences (>1000px = teleport/reconnect)
+        // ═══════════════════════════════════════════════════════════════════
+        const isPositionInvalid = lastPos.y < 0 || lastPos.x < 0;
+        const isPositionVeryStale = (now - senderPlayer.lastInputTime) > 5000; // 5 seconds
+        const isExtremeDifference = distance > 1000; // Teleport/reconnect threshold
+
+        // Reset first position flag if position is invalid, stale, or extreme difference
+        if (isPositionInvalid || isPositionVeryStale || isExtremeDifference) {
+          if (senderPlayer.hasReceivedFirstPosition) {
+            logger.info(
+              `🔄 Resetting first position flag for ${sender.username}: invalid=${isPositionInvalid}, stale=${isPositionVeryStale}, extreme=${isExtremeDifference}`
+            );
+            senderPlayer.hasReceivedFirstPosition = false;
+          }
+        }
+
         // Allow first position update without distance validation
         // This handles the case where client spawns at a different position than server default
         const isFirstPosition = !senderPlayer.hasReceivedFirstPosition;
@@ -872,6 +914,12 @@ function matchLoop(
           senderPlayer.lastPosition = { x: parsedData.x, y: parsedData.y };
           if (parsedData.d !== undefined) senderPlayer.direction = parsedData.d;
           if (parsedData.r !== undefined) senderPlayer.isRunning = parsedData.r;
+          // INDUSTRY STANDARD: Store collision flag for forwarding to other clients
+          if (parsedData.c !== undefined) senderPlayer.collided = parsedData.c;
+
+          // CRITICAL: Update lastInputTime to prevent Phase 2 simulation
+          // This ensures server doesn't simulate positions while client is sending updates
+          senderPlayer.lastInputTime = now;
 
           // Mark that we've received first position
           if (isFirstPosition) {
@@ -881,54 +929,60 @@ function matchLoop(
             );
           }
 
+          // Log collision for debugging
+          if (senderPlayer.collided) {
+            logger.info(
+              `🧱 Collision from ${sender.username}: (${parsedData.x}, ${parsedData.y})`
+            );
+          }
+
           // Update AOI grid
           aoiUpdatePlayer(state.aoiGrid, sender.userId, parsedData.x, parsedData.y);
 
-          // Store for broadcast
+          // Store for broadcast - use OP_SERVER_POSITION to include collision flag
+          // This ensures other clients receive the collision flag and SNAP instead of interpolating
           state.pendingUpdates[sender.userId] = {
             userId: sender.userId,
-            opCode: message.opCode,
-            data: message.data as ArrayBuffer,
-            reliable: message.reliable,
+            opCode: OP_SERVER_POSITION, // Use V4 format which includes collision flag
+            data: new ArrayBuffer(0), // Will be encoded in Phase 3
+            reliable: message.reliable || senderPlayer.collided, // Collision events are critical
           };
         } else {
-          // Suspicious movement - reject position but STILL update direction/running state
-          // This is critical: if player stops (isRunning=false), we must update that
-          // even if the position seems suspicious (could be lag/teleport)
+          // Suspicious movement - large distance jump detected
+          // This could be: lag spike, teleport, map change, or hack attempt
           logger.warn(
-            `⚠️ Suspicious movement from ${sender.username}: distance=${distance.toFixed(0)}, max=${maxAllowed.toFixed(0)}`
+            `⚠️ Suspicious movement from ${sender.username}: distance=${distance.toFixed(0)}, max=${maxAllowed.toFixed(0)}, lastPos=(${lastPos.x.toFixed(0)}, ${lastPos.y.toFixed(0)}), newPos=(${parsedData.x}, ${parsedData.y})`
           );
 
-          // CRITICAL FIX: Still update direction and isRunning state
-          // This ensures player stops animating on other clients even if position is rejected
+          // ═══════════════════════════════════════════════════════════════════
+          // FIX: Accept position if player is stopping (isRunning=false)
+          // When player stops after lag, we should trust the stop position
+          // This prevents "ghost running" where player appears to keep moving
+          // ═══════════════════════════════════════════════════════════════════
+          const isStopMessage = parsedData.r === false;
+
+          if (isStopMessage) {
+            // ACCEPT the new position when player stops
+            // This is critical: player stopped, we need their final position
+            logger.info(
+              `🛑 Player ${sender.username} stopped - accepting final position (${parsedData.x}, ${parsedData.y})`
+            );
+            senderPlayer.lastPosition = { x: parsedData.x, y: parsedData.y };
+            aoiUpdatePlayer(state.aoiGrid, sender.userId, parsedData.x, parsedData.y);
+          }
+
+          // Always update direction and isRunning state
           if (parsedData.d !== undefined) senderPlayer.direction = parsedData.d;
           if (parsedData.r !== undefined) senderPlayer.isRunning = parsedData.r;
+          senderPlayer.lastInputTime = now;
 
-          // If player stopped (isRunning=false), broadcast their current position with updated state
-          // This ensures other clients see the player stop animating at their last known position
-          if (parsedData.r === false) {
-
-            // Encode current position with updated running state (use encodeServerPosition)
-            const stopData = encodeServerPosition(
-              senderPlayer.lastPosition.x,
-              senderPlayer.lastPosition.y,
-              senderPlayer.direction,
-              false, // isRunning = false
-              0 // sequence (0 for stop event)
-            );
-
-            // Store for broadcast
-            state.pendingUpdates[sender.userId] = {
-              userId: sender.userId,
-              opCode: message.opCode,
-              data: stopData,
-              reliable: true, // Stop events are critical
-            };
-
-            logger.info(
-              `🛑 Player ${sender.username} stopped - broadcasting stop state at (${senderPlayer.lastPosition.x}, ${senderPlayer.lastPosition.y})`
-            );
-          }
+          // Broadcast current state
+          state.pendingUpdates[sender.userId] = {
+            userId: sender.userId,
+            opCode: OP_SERVER_POSITION,
+            data: new ArrayBuffer(0),
+            reliable: true,
+          };
         }
       }
     } else if (message.opCode === OP_MAP_CHANGE) {
@@ -937,7 +991,21 @@ function matchLoop(
         const jsonStr = nk.binaryToString(message.data as ArrayBuffer);
         const data = JSON.parse(jsonStr);
         if (data.d && data.d.map) {
-          senderPlayer.currentMap = data.d.map;
+          const oldMap = senderPlayer.currentMap;
+          const newMap = data.d.map;
+          senderPlayer.currentMap = newMap;
+
+          // ═══════════════════════════════════════════════════════════════════
+          // FIX: Reset position state on map change
+          // This prevents position desync when entering a new map
+          // ═══════════════════════════════════════════════════════════════════
+          senderPlayer.hasReceivedFirstPosition = false; // Wait for new position
+          senderPlayer.isRunning = false; // Stop movement during transition
+          senderPlayer.direction = DIR_NONE;
+
+          logger.info(
+            `🗺️ Player ${sender.username} changed map: ${oldMap} → ${newMap}`
+          );
         }
       } catch {
         // Ignore
@@ -946,50 +1014,23 @@ function matchLoop(
   }
 
   // ============================================================================
-  // PHASE 2: Server-side movement calculation for input-based players
+  // PHASE 2: REMOVED - No server-side simulation
+  // ============================================================================
+  // INDUSTRY STANDARD (LoL, Fortnite, Dota 2):
+  // - Server does NOT simulate player movement
+  // - Server only RELAYS what clients send
+  // - Client is authoritative for their own position
+  // - Server validates for anti-cheat only
+  //
+  // Benefits:
+  // - No ghost player simulation bugs
+  // - No position desync from server simulation
+  // - Simpler, more predictable behavior
+  // - Lower server CPU usage
   // ============================================================================
 
-  for (const player of Object.values(state.players)) {
-    // Only process players with active input
-    // Skip if: direction is none OR player is not moving (isRunning = false means stopped)
-    // Note: isRunning here means "is actively moving" not "running vs walking"
-    if (player.direction === DIR_NONE || !player.isRunning) continue;
-
-    // Calculate velocity based on direction
-    const velocity = calculateVelocity(player.direction, player.isRunning);
-
-    if (velocity.vx !== 0 || velocity.vy !== 0) {
-      // Update position
-      const newPos = updatePosition(
-        player.lastPosition.x,
-        player.lastPosition.y,
-        velocity.vx,
-        velocity.vy,
-        tickDt
-      );
-
-      // TODO: Add collision checking here if needed
-      // For now, just update position
-
-      player.lastPosition = newPos;
-
-      // Update AOI grid
-      aoiUpdatePlayer(state.aoiGrid, player.userId, newPos.x, newPos.y);
-
-      // Ensure this player's position is broadcast
-      if (!state.pendingUpdates[player.userId]) {
-        state.pendingUpdates[player.userId] = {
-          userId: player.userId,
-          opCode: OP_SERVER_POSITION,
-          data: new ArrayBuffer(0),
-          reliable: false, // Position updates can be unreliable for performance
-        };
-      }
-    }
-  }
-
   // ============================================================================
-  // PHASE 3: Broadcast updates with AOI + Map filtering
+  // PHASE 2 (renamed): Broadcast updates with AOI + Map filtering
   // ============================================================================
 
   for (const senderId in state.pendingUpdates) {
@@ -1035,15 +1076,20 @@ function matchLoop(
       let opCodeToSend: number;
 
       if (update.opCode === OP_SERVER_POSITION) {
-        // Encode authoritative position
+        // Encode authoritative position with COLLISION FLAG (INDUSTRY STANDARD)
+        // When collided=true, clients will SNAP to position (no interpolation past walls)
         dataToSend = encodeServerPosition(
           senderPlayer.lastPosition.x,
           senderPlayer.lastPosition.y,
           senderPlayer.direction,
           senderPlayer.isRunning,
-          senderPlayer.lastInputSequence
+          senderPlayer.lastInputSequence,
+          senderPlayer.collided  // CRITICAL: Forward collision flag for snap-on-collision
         );
         opCodeToSend = OP_SERVER_POSITION;
+
+        // Reset collision flag after sending (only valid for one frame)
+        senderPlayer.collided = false;
       } else {
         // Legacy: forward original data
         dataToSend = update.data;
